@@ -80,14 +80,25 @@ def get_available_dates(
 ) -> Union[List[datetime.date], None]:
     request_tracker.log_retry()
     request_tracker.retry()
-    current_url = driver.current_url
-    request_url = current_url + AVAILABLE_DATE_REQUEST_SUFFIX
-    request_header_cookie = "".join(
-        [f"{cookie['name']}={cookie['value']};" for cookie in driver.get_cookies()]
-    )
-    request_headers = REQUEST_HEADERS.copy()
-    request_headers["Cookie"] = request_header_cookie
-    request_headers["User-Agent"] = driver.execute_script("return navigator.userAgent")
+    try:
+        # 检查浏览器会话是否仍然有效
+        current_url = driver.current_url
+    except Exception as e:
+        log_message(f"Browser session lost: {e}")
+        raise  # 重新抛出异常，让调用者知道需要重新创建会话
+    
+    try:
+        request_url = current_url + AVAILABLE_DATE_REQUEST_SUFFIX
+        request_header_cookie = "".join(
+            [f"{cookie['name']}={cookie['value']};" for cookie in driver.get_cookies()]
+        )
+        request_headers = REQUEST_HEADERS.copy()
+        request_headers["Cookie"] = request_header_cookie
+        request_headers["User-Agent"] = driver.execute_script("return navigator.userAgent")
+    except Exception as e:
+        log_message(f"Failed to get cookies or user agent: {e}")
+        raise  # 重新抛出异常，让调用者知道需要重新创建会话
+    
     try:
         response = requests.get(request_url, headers=request_headers)
     except Exception as e:
@@ -113,7 +124,13 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
         DATE_REQUEST_DELAY * retryCount if (retryCount > 0) else DATE_REQUEST_MAX_TIME
     )
     while date_request_tracker.should_retry():
-        dates = get_available_dates(driver, date_request_tracker)
+        try:
+            dates = get_available_dates(driver, date_request_tracker)
+        except Exception as e:
+            log_message(f"Browser session error in get_available_dates: {e}")
+            log_message("Browser session may have been lost, need to recreate session")
+            raise  # 重新抛出异常，让调用者知道需要重新创建会话
+        
         if not dates:
             log_message("Error occured when requesting available dates")
             sleep(DATE_REQUEST_DELAY)
@@ -165,8 +182,21 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> boo
             session_failures += 1
             sleep(FAIL_RETRY_DELAY)
             continue
-    rescheduled = reschedule(driver, retryCount)
-    driver.quit()
+    
+    try:
+        rescheduled = reschedule(driver, retryCount)
+    except Exception as e:
+        log_message(f"Browser session lost during reschedule: {e}")
+        log_message("Attempting to recreate session...")
+        driver.quit()
+        # 重新创建会话并重试
+        return reschedule_with_new_session(retryCount)
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass  # 如果 driver 已经关闭，忽略错误
+    
     if rescheduled:
         return True
     else:
