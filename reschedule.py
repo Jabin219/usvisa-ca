@@ -1,8 +1,11 @@
 import re
 import traceback
-from datetime import datetime
+import os
+import shutil
+import glob
+from datetime import datetime, timedelta
 from time import sleep
-from typing import Union, List
+from typing import Union, List, Tuple
 
 import requests
 from selenium import webdriver
@@ -21,7 +24,69 @@ def log_message(message: str) -> None:
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] {message}")
 
-def get_chrome_driver() -> WebDriver:
+
+def cleanup_old_chrome_dirs(max_age_hours: int = 24, exclude_dirs: List[str] = None) -> None:
+    """
+    清理旧的Chrome临时目录
+    
+    Args:
+        max_age_hours: 保留多少小时内的目录（默认24小时）
+        exclude_dirs: 要排除的目录列表（当前正在使用的目录）
+    """
+    if exclude_dirs is None:
+        exclude_dirs = []
+    
+    try:
+        # 查找所有匹配的Chrome临时目录
+        pattern = "/tmp/chrome-*"
+        chrome_dirs = glob.glob(pattern)
+        
+        current_time = datetime.now()
+        cleaned_count = 0
+        total_size = 0
+        
+        for dir_path in chrome_dirs:
+            # 跳过当前正在使用的目录
+            if dir_path in exclude_dirs:
+                continue
+            
+            try:
+                # 获取目录的修改时间
+                dir_mtime = datetime.fromtimestamp(os.path.getmtime(dir_path))
+                age = current_time - dir_mtime
+                
+                # 如果目录超过指定时间，则删除
+                if age > timedelta(hours=max_age_hours):
+                    # 计算目录大小
+                    dir_size = sum(
+                        os.path.getsize(os.path.join(dirpath, filename))
+                        for dirpath, dirnames, filenames in os.walk(dir_path)
+                        for filename in filenames
+                    )
+                    total_size += dir_size
+                    
+                    # 删除目录
+                    shutil.rmtree(dir_path, ignore_errors=True)
+                    cleaned_count += 1
+                    log_message(f"已清理旧目录: {dir_path} (年龄: {age}, 大小: {dir_size / 1024 / 1024:.2f} MB)")
+            except Exception as e:
+                # 如果无法访问或删除某个目录，记录日志但继续处理其他目录
+                log_message(f"清理目录时出错 {dir_path}: {e}")
+                continue
+        
+        if cleaned_count > 0:
+            log_message(f"清理完成: 删除了 {cleaned_count} 个旧目录，释放了 {total_size / 1024 / 1024:.2f} MB 空间")
+    except Exception as e:
+        log_message(f"清理临时目录时出错: {e}")
+
+
+def get_chrome_driver() -> Tuple[WebDriver, str]:
+    """
+    创建Chrome驱动并返回驱动实例和临时目录路径
+    
+    Returns:
+        tuple: (WebDriver实例, 临时目录路径)
+    """
     options = webdriver.ChromeOptions()
     if not SHOW_GUI:
         options.add_argument("headless")
@@ -32,9 +97,16 @@ def get_chrome_driver() -> WebDriver:
     options.add_argument('--incognito')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
-    options.add_argument(f'--user-data-dir=/tmp/chrome-{datetime.now().strftime("%Y%m%d-%H%M%S")}')
+    
+    # 创建临时目录路径
+    temp_dir = f'/tmp/chrome-{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+    options.add_argument(f'--user-data-dir={temp_dir}')
+    
+    # 在创建新驱动前清理旧目录（排除当前目录）
+    cleanup_old_chrome_dirs(max_age_hours=1, exclude_dirs=[temp_dir])
+    
     driver = webdriver.Chrome(options=options)
-    return driver
+    return driver, temp_dir
 
 
 def login(driver: WebDriver) -> None:
@@ -170,7 +242,7 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
 
 
 def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> bool:
-    driver = get_chrome_driver()
+    driver, temp_dir = get_chrome_driver()
     session_failures = 0
     while session_failures < NEW_SESSION_AFTER_FAILURES:
         try:
@@ -188,7 +260,16 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> boo
     except Exception as e:
         log_message(f"Browser session lost during reschedule: {e}")
         log_message("Attempting to recreate session...")
-        driver.quit()
+        try:
+            driver.quit()
+        except:
+            pass
+        # 清理当前会话的临时目录
+        try:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
         # 重新创建会话并重试
         return reschedule_with_new_session(retryCount)
     finally:
@@ -196,6 +277,13 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> boo
             driver.quit()
         except:
             pass  # 如果 driver 已经关闭，忽略错误
+        # 清理当前会话的临时目录
+        try:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                log_message(f"已清理临时目录: {temp_dir}")
+        except Exception as e:
+            log_message(f"清理临时目录时出错 {temp_dir}: {e}")
     
     if rescheduled:
         return True
@@ -217,13 +305,23 @@ if __name__ == "__main__":
     else:
         log_message("No date ranges excluded")
 
-    while True:
-        session_count += 1
-        log_message(f"Attempting with new session #{session_count}")
-        rescheduled = reschedule_with_new_session()
-        sleep(NEW_SESSION_DELAY)
-        if rescheduled:
-            break
+    # 程序启动时清理所有旧的临时目录
+    log_message("正在清理旧的临时目录...")
+    cleanup_old_chrome_dirs(max_age_hours=1)
+
+    try:
+        while True:
+            session_count += 1
+            log_message(f"Attempting with new session #{session_count}")
+            rescheduled = reschedule_with_new_session()
+            sleep(NEW_SESSION_DELAY)
+            if rescheduled:
+                break
+    finally:
+        # 程序退出前再次清理临时目录
+        log_message("程序退出，清理所有临时目录...")
+        cleanup_old_chrome_dirs(max_age_hours=0)
+    
     gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
     msg = Message(
         f"Rescheduler Program Exited",
