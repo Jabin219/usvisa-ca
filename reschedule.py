@@ -160,7 +160,8 @@ def get_available_dates(
         raise  # 重新抛出异常，让调用者知道需要重新创建会话
     
     try:
-        request_url = current_url + AVAILABLE_DATE_REQUEST_SUFFIX
+        schedule_base = current_url.split("/appointment")[0]
+        request_url = schedule_base + "/appointment" + AVAILABLE_DATE_REQUEST_SUFFIX
         request_header_cookie = "".join(
             [f"{cookie['name']}={cookie['value']};" for cookie in driver.get_cookies()]
         )
@@ -170,7 +171,6 @@ def get_available_dates(
     except Exception as e:
         log_message(f"Failed to get cookies or user agent: {e}")
         raise  # 重新抛出异常，让调用者知道需要重新创建会话
-    
     try:
         response = requests.get(request_url, headers=request_headers)
     except Exception as e:
@@ -244,10 +244,15 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
 def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> bool:
     driver, temp_dir = get_chrome_driver()
     session_failures = 0
+    timeout = TIMEOUT
     while session_failures < NEW_SESSION_AFTER_FAILURES:
         try:
             login(driver)
             get_appointment_page(driver)
+            policy_checkbox_limit = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.CLASS_NAME, "icheckbox")))
+            policy_checkbox_limit.click()
+            continue_button = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.NAME, "commit")))
+            continue_button.click() 
             break
         except Exception as e:
             log_message(f"Unable to get appointment page: {e}")
