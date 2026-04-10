@@ -71,8 +71,9 @@ SHOW_GUI = False  # toggle to false if you don't want to see the browser
 # For testing, also set a date really far away so the app actually tries to reschedule
 TEST_MODE = False
 
-# Don't change the following unless you know what you are doing
-DETACH = True
+# False：driver.quit() 会关掉浏览器，循环重试时 Dock 不会堆多个 Chrome。
+# True：脚本结束后保留窗口便于调试，但与「每轮新会话」一起用会叠很多 Chrome。
+DETACH = False
 NEW_SESSION_AFTER_FAILURES = 5
 NEW_SESSION_DELAY = 120
 TIMEOUT = 10
