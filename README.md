@@ -4,7 +4,7 @@ A simple Python script for making US visa interview appointments in Canada
 
 ## Update
 
-- 🎉 The core functionality is still working (as of **March 2026**) according to users' report
+- The core functionality is still working (as of **March 2026**) according to users' report
 - Gmail-related code might error out, but it doesn't block rescheduling
 - Adopt this repo: this project is looking for a new maintainer, open an issue if you'd like to adopt it.
 

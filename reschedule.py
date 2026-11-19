@@ -11,6 +11,7 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -134,16 +135,94 @@ def login(driver: WebDriver) -> None:
     login_button.click()
 
 
+def _find_visible_action(driver: WebDriver, label: str):
+    locators = (
+        (By.LINK_TEXT, label),
+        (By.XPATH, f"//button[normalize-space()='{label}']"),
+        (By.XPATH, f"//input[@value='{label}']"),
+    )
+    for locator in locators:
+        for element in driver.find_elements(*locator):
+            if element.is_displayed() and element.is_enabled():
+                return element
+    return False
+
+
+def _click_action_if_present(
+    driver: WebDriver, label: str, timeout: float
+) -> bool:
+    try:
+        action = WebDriverWait(driver, timeout).until(
+            lambda current_driver: _find_visible_action(current_driver, label)
+        )
+    except TimeoutException:
+        return False
+    action.click()
+    sleep(2)
+    return True
+
+
+def _has_visible_element(driver: WebDriver, locator) -> bool:
+    return any(
+        element.is_displayed()
+        for element in driver.find_elements(*locator)
+    )
+
+
+def _appointment_page_state(driver: WebDriver):
+    if _has_visible_element(
+        driver, (By.ID, "appointments_consulate_appointment_date_input")
+    ):
+        return "ready"
+    if _find_visible_action(driver, "Schedule Appointment"):
+        return "schedule"
+    if _has_visible_element(driver, (By.CLASS_NAME, "icheckbox")):
+        return "policy"
+    return False
+
+
+def _prepare_appointment_page(driver: WebDriver) -> None:
+    timeout = TIMEOUT
+    for _ in range(3):
+        state = WebDriverWait(driver, timeout).until(_appointment_page_state)
+        if state == "ready":
+            return
+        if state == "schedule":
+            _click_action_if_present(driver, "Schedule Appointment", timeout)
+            continue
+
+        policy_checkbox = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.CLASS_NAME, "icheckbox"))
+        )
+        policy_checkbox.click()
+        continue_button = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.NAME, "commit"))
+        )
+        continue_button.click()
+
+    WebDriverWait(driver, timeout).until(
+        lambda current_driver: _appointment_page_state(current_driver) == "ready"
+    )
+
+
 def get_appointment_page(driver: WebDriver) -> None:
     timeout = TIMEOUT
-    continue_button = WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((By.LINK_TEXT, "Continue"))
-    )
-    continue_button.click()
-    sleep(2)
+
+    # Newer flows show a group-action page with this link. Older flows first
+    # show a Continue link and then expose Schedule Appointment.
+    if not _click_action_if_present(driver, "Schedule Appointment", 2):
+        if not _click_action_if_present(driver, "Continue", timeout):
+            raise TimeoutException(
+                "Could not find either 'Schedule Appointment' or 'Continue'"
+            )
+        _click_action_if_present(driver, "Schedule Appointment", timeout)
+
     current_url = driver.current_url
-    url_id = re.search(r"/(\d+)", current_url).group(1)
-    appointment_url = APPOINTMENT_PAGE_URL.format(id=url_id)
+    schedule_match = re.search(r"/schedule/(\d+)", current_url)
+    if not schedule_match:
+        raise RuntimeError(f"Could not find schedule id in URL: {current_url}")
+
+    appointment_url = APPOINTMENT_PAGE_URL.format(id=schedule_match.group(1))
     driver.get(appointment_url)
 
 
@@ -249,13 +328,10 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> boo
         try:
             login(driver)
             get_appointment_page(driver)
-            policy_checkbox_limit = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.CLASS_NAME, "icheckbox")))
-            policy_checkbox_limit.click()
-            continue_button = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.NAME, "commit")))
-            continue_button.click() 
+            _prepare_appointment_page(driver)
             break
         except Exception as e:
-            log_message(f"Unable to get appointment page: {e}")
+            log_message(f"Unable to get appointment page at {driver.current_url}: {e}")
             session_failures += 1
             sleep(FAIL_RETRY_DELAY)
             continue
