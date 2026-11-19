@@ -1,113 +1,115 @@
-from time import sleep
-from datetime import datetime, date
+from datetime import date, datetime
 
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.chrome.webdriver import WebDriver
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
-from settings import TEST_MODE, NUM_PARTICIPANTS
+from settings import CONSULATES, TEST_MODE, TIMEOUT, USER_CONSULATE
 
-# This is frankly very, very bad and should be rewritten with requests
-# when I get a test account
-def legacy_reschedule(driver: WebDriver, date_to_book: date):
-    driver.refresh()
 
-    # Continue btn: applicable when there are more than one applicant for scheduling
-    if NUM_PARTICIPANTS > 1:
-        continueBtn = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, "//main[@id='main']/div[@class='mainContent']/form/div[2]/div/input"))
-            )
-        continueBtn.click()
+CONSULATE_FIELD = (By.ID, "appointments_consulate_appointment_facility_id")
+DATE_FIELD = (By.ID, "appointments_consulate_appointment_date")
+DATE_PICKER = (By.ID, "ui-datepicker-div")
+TIME_FIELD = (By.ID, "appointments_consulate_appointment_time")
 
-    date_selection_box = WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located(
-            (
-                By.ID, 'appointments_consulate_appointment_date_input'
-            )
-        )
-    )
-    sleep(2)
-    date_selection_box.click()
 
-    # Move to next month
-    def next_month():
-        driver.find_element(By.XPATH, "//div[@id='ui-datepicker-div']/div[2]/div/a").click()
+class AppointmentSubmissionUnknown(RuntimeError):
+    """The confirmation click may have reached the appointment service."""
 
-    # Check if avalible in current month
-    def cur_month_ava():
-        month = driver.find_element(By.XPATH, "//div[@id='ui-datepicker-div']/div[1]/table/tbody")
-        dates = month.find_elements(By.TAG_NAME, "td")
-        for date in dates:
-            if date.get_attribute("class") == " undefined":
-                ava_date_btn = date.find_element(By.TAG_NAME, "a")
-                return True
-        return False
 
-    # Check the nearest slot is avalible in # months (0 for this month, 1 for next month...) and move to the month
-    def nearest_ava():
-        ava_in = 0
-        cur = cur_month_ava()
-        while not cur:
-            next_month()
-            cur = cur_month_ava()
-            ava_in += 1
-        return ava_in
+def select_consulate(driver: WebDriver) -> str:
+    field = WebDriverWait(driver, TIMEOUT).until(EC.element_to_be_clickable(CONSULATE_FIELD))
+    consulate_id = str(CONSULATES[USER_CONSULATE])
+    Select(field).select_by_value(consulate_id)
+    if field.get_property("value") != consulate_id:
+        raise RuntimeError(f"Could not select {USER_CONSULATE} on the appointment form")
+    return consulate_id
 
-    avalible_in_months = nearest_ava()
 
-    # Reschedule if the avalible_in_months is less than or equal to wait month
-    print("Trying to pick time and reschedule...")
-    month = driver.find_element(By.XPATH, "//div[@id='ui-datepicker-div']/div[1]/table/tbody")
-    dates = month.find_elements(By.TAG_NAME, "td")
-    ava_date_btn = None
-    for date in dates:
-        if date.get_attribute("class") == " undefined":
-            ava_date_btn = date.find_element(By.TAG_NAME, "a")
-            break
-    ava_date_btn.click()
+def _displayed_month(picker) -> date:
+    title = picker.find_element(By.CLASS_NAME, "ui-datepicker-title").text
+    return datetime.strptime(title, "%B %Y").date()
 
-    # confirm selected date
-    sleep(2)
-    date_box = WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located(
-            (
-                By.ID, 'appointments_consulate_appointment_date'
-            )
-        )
-    )
-    date_selected = datetime.strptime(date_box.get_attribute('value'), "%Y-%m-%d").date()
-    print(date_selected)
-    if not date_selected <= date_to_book:
-        print(f"{datetime.now().strftime('%H:%M:%S')} SLOT '{date_to_book}' no longer available\n")
-        return False
-    else:
-        print(f"{datetime.now().strftime('%H:%M:%S')} SLOT '{date_selected}' is still available. Booking....\n")
 
-    # Select time of the date:
-    sleep(2)
-    appointment_time = WebDriverWait(driver, 10).until(
-        EC.element_to_be_clickable((By.ID, "appointments_consulate_appointment_time"))
-    )
-    appointment_time.click()
-    appointment_time_options = appointment_time.find_elements(By.TAG_NAME, "option")
-    appointment_time_options[len(appointment_time_options) - 1].click()
-
-    # Click "Reschedule"
-    driver.find_element(
+def _select_date(driver: WebDriver, date_to_book: date) -> bool:
+    wait = WebDriverWait(driver, TIMEOUT)
+    if not EC.visibility_of_element_located(DATE_PICKER)(driver):
+        wait.until(EC.element_to_be_clickable(
+            (By.ID, "appointments_consulate_appointment_date_input")
+        )).click()
+    picker = wait.until(EC.visibility_of_element_located(DATE_PICKER))
+    target_month = date_to_book.replace(day=1)
+    month = _displayed_month(picker)
+    month_offset = (target_month.year - month.year) * 12 + target_month.month - month.month
+    direction = "next" if month_offset > 0 else "prev"
+    target_day = (
         By.XPATH,
-        "//form[@id='appointment-form']/div[2]/fieldset/ol/li/input",
-    ).click()
-    sleep(2)
-    try:
-        confirm = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, "/html/body/div[6]/div/div/a[2]"))
-        )
-    finally:
-        sleep(2)
-        driver.implicitly_wait(0.1)
-        if not TEST_MODE:
-            confirm.click()
-            return True
+        f".//td[@data-year='{date_to_book.year}' and @data-month='{date_to_book.month - 1}']"
+        f"/a[normalize-space()='{date_to_book.day}']",
+    )
 
+    for _ in range(abs(month_offset) + 1):
+        days = picker.find_elements(*target_day)
+        if days:
+            days[0].click()
+            return True
+        if month == target_month:
+            break
+        controls = picker.find_elements(
+            By.CSS_SELECTOR, f".ui-datepicker-{direction}:not(.ui-state-disabled)"
+        )
+        if not controls:
+            break
+        controls[0].click()
+        wait.until(lambda _: _displayed_month(picker) != month)
+        month = _displayed_month(picker)
     return False
+
+
+def _last_available_time(driver: WebDriver):
+    time_field = driver.find_element(*TIME_FIELD)
+    if not time_field.is_displayed() or not time_field.is_enabled():
+        return False
+    options = [
+        option for option in Select(time_field).options
+        if option.is_enabled() and option.get_property("value")
+    ]
+    return options[-1] if options else False
+
+
+def legacy_reschedule(driver: WebDriver, date_to_book: date) -> bool:
+    """Return whether an exact slot was previewed or submitted."""
+    consulate_id = select_consulate(driver)
+    wait = WebDriverWait(driver, TIMEOUT)
+    try:
+        if not _select_date(driver, date_to_book):
+            return False
+        time_option = wait.until(_last_available_time)
+        appointment_time = time_option.text
+        time_value = time_option.get_property("value")
+        time_option.click()
+    except TimeoutException:
+        return False
+
+    selected_city = driver.find_element(*CONSULATE_FIELD).get_property("value")
+    selected_date = driver.find_element(*DATE_FIELD).get_property("value")
+    selected_time = driver.find_element(*TIME_FIELD).get_property("value")
+    if selected_city != consulate_id or selected_date != date_to_book.isoformat() or selected_time != time_value:
+        return False
+
+    if TEST_MODE:
+        print(f"Test mode: selected {USER_CONSULATE} on {date_to_book} at {appointment_time}")
+        return True
+
+    submit = wait.until(EC.element_to_be_clickable((By.ID, "appointments_submit")))
+    try:
+        submit.click()
+        confirm = wait.until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[6]/div/div/a[2]")))
+        confirm.click()
+    except WebDriverException as error:
+        raise AppointmentSubmissionUnknown(
+            "Confirmation status is unknown. Check your AIS account before running again."
+        ) from error
+    return True

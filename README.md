@@ -70,13 +70,19 @@ EXCLUSION_END_DATE_2=""     # End date for second excluded date range
 
 You can add upto 9 exclusion date ranges. Each date range to be excluded using the syntax `EXCLUSION_START_DATE_{i}` and `EXCLUSION_END_DATE_{i}` where `i` can be replaced by numbers between 1 to 9.
 
-### Find a slot and book it automatically
+### Check the configuration and look for a slot
+
+```sh
+python reschedule.py --check
+```
+
+This signs in using `.env`, selects the configured consulate, checks for dates once, and exits.
 
 ```sh
 python reschedule.py
 ```
 
-See the script in action. Once you're satisfied with its functionality, set `TEST_MODE` to `False` in `settings.py`. For a headless operation, you can also set `SHOW_GUI` to `False` and allow the script to run unattended.
+With the default `TEST_MODE = True`, polling continues until it can preview a matching city, date, and time. The preview stops before form submission. Set `TEST_MODE = False` in `settings.py` to enable submission. Check your AIS account after the script reports a submission.
 
 Note `detect_and_notify.py` is no longer maintained.
 

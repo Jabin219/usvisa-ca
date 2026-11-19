@@ -1,11 +1,10 @@
+import argparse
 import re
-import traceback
-import os
 import shutil
-import glob
-from datetime import datetime, timedelta
+import tempfile
+from datetime import date, datetime
 from time import sleep
-from typing import Union, List, Tuple
+from urllib.parse import urlsplit
 
 import requests
 from selenium import webdriver
@@ -16,7 +15,12 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from legacy.gmail import GMail, Message
-from legacy_rescheduler import legacy_reschedule
+from legacy_rescheduler import (
+    CONSULATE_FIELD,
+    AppointmentSubmissionUnknown,
+    legacy_reschedule,
+    select_consulate,
+)
 from request_tracker import RequestTracker
 from settings import *
 
@@ -26,68 +30,7 @@ def log_message(message: str) -> None:
     print(f"[{timestamp}] {message}")
 
 
-def cleanup_old_chrome_dirs(max_age_hours: int = 24, exclude_dirs: List[str] = None) -> None:
-    """
-    清理旧的Chrome临时目录
-    
-    Args:
-        max_age_hours: 保留多少小时内的目录（默认24小时）
-        exclude_dirs: 要排除的目录列表（当前正在使用的目录）
-    """
-    if exclude_dirs is None:
-        exclude_dirs = []
-    
-    try:
-        # 查找所有匹配的Chrome临时目录
-        pattern = "/tmp/chrome-*"
-        chrome_dirs = glob.glob(pattern)
-        
-        current_time = datetime.now()
-        cleaned_count = 0
-        total_size = 0
-        
-        for dir_path in chrome_dirs:
-            # 跳过当前正在使用的目录
-            if dir_path in exclude_dirs:
-                continue
-            
-            try:
-                # 获取目录的修改时间
-                dir_mtime = datetime.fromtimestamp(os.path.getmtime(dir_path))
-                age = current_time - dir_mtime
-                
-                # 如果目录超过指定时间，则删除
-                if age > timedelta(hours=max_age_hours):
-                    # 计算目录大小
-                    dir_size = sum(
-                        os.path.getsize(os.path.join(dirpath, filename))
-                        for dirpath, dirnames, filenames in os.walk(dir_path)
-                        for filename in filenames
-                    )
-                    total_size += dir_size
-                    
-                    # 删除目录
-                    shutil.rmtree(dir_path, ignore_errors=True)
-                    cleaned_count += 1
-                    log_message(f"已清理旧目录: {dir_path} (年龄: {age}, 大小: {dir_size / 1024 / 1024:.2f} MB)")
-            except Exception as e:
-                # 如果无法访问或删除某个目录，记录日志但继续处理其他目录
-                log_message(f"清理目录时出错 {dir_path}: {e}")
-                continue
-        
-        if cleaned_count > 0:
-            log_message(f"清理完成: 删除了 {cleaned_count} 个旧目录，释放了 {total_size / 1024 / 1024:.2f} MB 空间")
-    except Exception as e:
-        log_message(f"清理临时目录时出错: {e}")
-
-
-def get_chrome_driver() -> Tuple[WebDriver, str]:
-    """
-    创建Chrome驱动并返回驱动实例和临时目录路径
-    
-    Returns:
-        tuple: (WebDriver实例, 临时目录路径)
-    """
+def get_chrome_driver() -> tuple[WebDriver, str]:
     options = webdriver.ChromeOptions()
     if not SHOW_GUI:
         options.add_argument("headless")
@@ -98,15 +41,14 @@ def get_chrome_driver() -> Tuple[WebDriver, str]:
     options.add_argument('--incognito')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
-    
-    # 创建临时目录路径
-    temp_dir = f'/tmp/chrome-{datetime.now().strftime("%Y%m%d-%H%M%S")}'
-    options.add_argument(f'--user-data-dir={temp_dir}')
-    
-    # 在创建新驱动前清理旧目录（排除当前目录）
-    cleanup_old_chrome_dirs(max_age_hours=1, exclude_dirs=[temp_dir])
-    
-    driver = webdriver.Chrome(options=options)
+
+    temp_dir = tempfile.mkdtemp(prefix="usvisa-chrome-")
+    options.add_argument(f"--user-data-dir={temp_dir}")
+    try:
+        driver = webdriver.Chrome(options=options)
+    except BaseException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
     return driver, temp_dir
 
 
@@ -170,14 +112,14 @@ def _has_visible_element(driver: WebDriver, locator) -> bool:
 
 
 def _appointment_page_state(driver: WebDriver):
-    if _has_visible_element(
-        driver, (By.ID, "appointments_consulate_appointment_date_input")
-    ):
+    if _has_visible_element(driver, CONSULATE_FIELD):
         return "ready"
     if _find_visible_action(driver, "Schedule Appointment"):
         return "schedule"
     if _has_visible_element(driver, (By.CLASS_NAME, "icheckbox")):
         return "policy"
+    if NUM_PARTICIPANTS > 1 and _find_visible_action(driver, "Continue"):
+        return "participants"
     return False
 
 
@@ -187,18 +129,18 @@ def _prepare_appointment_page(driver: WebDriver) -> None:
         state = WebDriverWait(driver, timeout).until(_appointment_page_state)
         if state == "ready":
             return
-        if state == "schedule":
-            _click_action_if_present(driver, "Schedule Appointment", timeout)
+        if state in ("schedule", "participants"):
+            label = "Schedule Appointment" if state == "schedule" else "Continue"
+            _click_action_if_present(driver, label, timeout)
             continue
 
         policy_checkbox = WebDriverWait(driver, timeout).until(
             EC.element_to_be_clickable((By.CLASS_NAME, "icheckbox"))
         )
         policy_checkbox.click()
-        continue_button = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.NAME, "commit"))
-        )
-        continue_button.click()
+        WebDriverWait(driver, timeout).until(
+            lambda current_driver: _find_visible_action(current_driver, "Continue")
+        ).click()
 
     WebDriverWait(driver, timeout).until(
         lambda current_driver: _appointment_page_state(current_driver) == "ready"
@@ -215,12 +157,13 @@ def get_appointment_page(driver: WebDriver) -> None:
             raise TimeoutException(
                 "Could not find either 'Schedule Appointment' or 'Continue'"
             )
-        _click_action_if_present(driver, "Schedule Appointment", timeout)
+        has_schedule_id = re.search(r"/schedule/\d+", driver.current_url)
+        _click_action_if_present(driver, "Schedule Appointment", 2 if has_schedule_id else timeout)
 
     current_url = driver.current_url
     schedule_match = re.search(r"/schedule/(\d+)", current_url)
     if not schedule_match:
-        raise RuntimeError(f"Could not find schedule id in URL: {current_url}")
+        raise RuntimeError("Could not find a schedule ID after sign-in")
 
     appointment_url = APPOINTMENT_PAGE_URL.format(id=schedule_match.group(1))
     driver.get(appointment_url)
@@ -228,186 +171,181 @@ def get_appointment_page(driver: WebDriver) -> None:
 
 def get_available_dates(
     driver: WebDriver, request_tracker: RequestTracker
-) -> Union[List[datetime.date], None]:
+) -> list[date] | None:
     request_tracker.log_retry()
     request_tracker.retry()
+    current_url = urlsplit(driver.current_url)
+    appointment_site = urlsplit(LOGIN_URL)
+    if (
+        current_url.scheme != appointment_site.scheme
+        or current_url.netloc != appointment_site.netloc
+        or not re.fullmatch(r"/en-ca/niv/schedule/\d+/appointment/?", current_url.path)
+    ):
+        raise RuntimeError("The browser is not on the appointment form")
+
+    request_url = (
+        f"{current_url.scheme}://{current_url.netloc}{current_url.path.rstrip('/')}"
+        f"{AVAILABLE_DATE_REQUEST_SUFFIX}"
+    )
+    request_headers = REQUEST_HEADERS.copy()
+    request_headers["Cookie"] = "; ".join(
+        f"{cookie['name']}={cookie['value']}" for cookie in driver.get_cookies()
+    )
+    request_headers["User-Agent"] = driver.execute_script("return navigator.userAgent")
     try:
-        # 检查浏览器会话是否仍然有效
-        current_url = driver.current_url
-    except Exception as e:
-        log_message(f"Browser session lost: {e}")
-        raise  # 重新抛出异常，让调用者知道需要重新创建会话
-    
-    try:
-        schedule_base = current_url.split("/appointment")[0]
-        request_url = schedule_base + "/appointment" + AVAILABLE_DATE_REQUEST_SUFFIX
-        request_header_cookie = "".join(
-            [f"{cookie['name']}={cookie['value']};" for cookie in driver.get_cookies()]
+        response = requests.get(
+            request_url, headers=request_headers, timeout=TIMEOUT, allow_redirects=False
         )
-        request_headers = REQUEST_HEADERS.copy()
-        request_headers["Cookie"] = request_header_cookie
-        request_headers["User-Agent"] = driver.execute_script("return navigator.userAgent")
-    except Exception as e:
-        log_message(f"Failed to get cookies or user agent: {e}")
-        raise  # 重新抛出异常，让调用者知道需要重新创建会话
-    try:
-        response = requests.get(request_url, headers=request_headers)
-    except Exception as e:
-        log_message(f"Get available dates request failed: {e}")
+    except requests.RequestException as error:
+        log_message(f"Date request failed: {type(error).__name__}")
         return None
     if response.status_code != 200:
-        log_message(f"Failed with status code {response.status_code}")
-        log_message(f"Response Text: {response.text}")
+        log_message(f"Date request returned HTTP {response.status_code}")
         return None
     try:
         dates_json = response.json()
-    except:
-        log_message("Failed to decode json")
-        log_message(f"Response Text: {response.text}")
+        if not isinstance(dates_json, list):
+            raise ValueError("Expected a list of dates")
+        return [date.fromisoformat(item["date"]) for item in dates_json]
+    except (KeyError, TypeError, ValueError):
+        log_message("Date request returned an invalid response")
         return None
-    dates = [datetime.strptime(item["date"], "%Y-%m-%d").date() for item in dates_json]
-    return dates
+
+
+def eligible_dates(dates: list[date]) -> list[date]:
+    try:
+        earliest = date.fromisoformat(EARLIEST_ACCEPTABLE_DATE)
+        latest = date.fromisoformat(LATEST_ACCEPTABLE_DATE)
+        exclusions = [
+            (date.fromisoformat(start), date.fromisoformat(end))
+            for start, end in EXCLUSION_DATE_RANGES
+        ]
+    except (TypeError, ValueError) as error:
+        raise ValueError("Set both start and end for each date range in YYYY-MM-DD format") from error
+    if earliest > latest or any(start > end for start, end in exclusions):
+        raise ValueError("Each date range must end on or after its start date")
+
+    return [
+        day for day in sorted(set(dates))
+        if earliest <= day <= latest and not any(start <= day <= end for start, end in exclusions)
+    ]
+
+
+def send_notification(subject: str, message: str) -> None:
+    if not all((GMAIL_EMAIL, GMAIL_APPLICATION_PWD, RECEIVER_EMAIL)):
+        return
+    gmail = None
+    try:
+        sender = f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>" if GMAIL_SENDER_NAME else GMAIL_EMAIL
+        recipient = f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>" if RECEIVER_NAME else RECEIVER_EMAIL
+        gmail = GMail(sender, GMAIL_APPLICATION_PWD)
+        gmail.send(Message(subject, to=recipient, text=message))
+    except Exception as error:
+        log_message(f"Email notification failed: {type(error).__name__}")
+    finally:
+        if gmail is not None:
+            try:
+                gmail.close()
+            except Exception as error:
+                log_message(f"Could not close email connection: {type(error).__name__}")
 
 
 def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
     date_request_tracker = RequestTracker(
-        retryCount if (retryCount > 0) else DATE_REQUEST_MAX_RETRY,
-        DATE_REQUEST_DELAY * retryCount if (retryCount > 0) else DATE_REQUEST_MAX_TIME
+        retryCount if retryCount > 0 else DATE_REQUEST_MAX_RETRY,
+        DATE_REQUEST_DELAY * retryCount if retryCount > 0 else DATE_REQUEST_MAX_TIME,
     )
     while date_request_tracker.should_retry():
-        try:
-            dates = get_available_dates(driver, date_request_tracker)
-        except Exception as e:
-            log_message(f"Browser session error in get_available_dates: {e}")
-            log_message("Browser session may have been lost, need to recreate session")
-            raise  # 重新抛出异常，让调用者知道需要重新创建会话
-        
-        if not dates:
-            log_message("Error occured when requesting available dates")
-            sleep(DATE_REQUEST_DELAY)
-            continue
-        earliest_available_date = dates[0]
-        earliest_acceptable_date = datetime.strptime(EARLIEST_ACCEPTABLE_DATE, "%Y-%m-%d").date()
-        latest_acceptable_date = datetime.strptime(LATEST_ACCEPTABLE_DATE, "%Y-%m-%d").date()
-        if earliest_acceptable_date <= earliest_available_date <= latest_acceptable_date:
-            # Check if the earliest available date falls in any of the excluded date ranges
-            for i, (start, end) in enumerate(EXCLUSION_DATE_RANGES, 1):
-                if datetime.strptime(start, "%Y-%m-%d").date() <= earliest_available_date <= datetime.strptime(end, "%Y-%m-%d").date():
-                    log_message(f"UH OH! Date falls in excluded date range: {start} to {end}")
-                    sleep(DATE_REQUEST_DELAY)
+        dates = get_available_dates(driver, date_request_tracker)
+        if dates is not None:
+            candidates = eligible_dates(dates)
+            if not candidates:
+                log_message(f"{len(dates)} available dates. None match your date preferences.")
+            for candidate in candidates:
+                log_message(f"Found a matching date at {USER_CONSULATE}: {candidate}")
+                if not legacy_reschedule(driver, candidate):
+                    log_message(f"Could not select the exact slot for {candidate}")
                     continue
-            log_message(f"FOUND SLOT ON {earliest_available_date}!!!")
-            try:
-                if legacy_reschedule(driver, earliest_available_date):
-                    gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
-                    msg = Message(
-                        f"Visa Appointment Rescheduled for {earliest_available_date}",
-                        to=f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>",
-                        text=f"Your visa appointment has been successfully rescheduled to {earliest_available_date} at {USER_CONSULATE} consulate."
+                if not TEST_MODE:
+                    message = (
+                        f"Submitted a reschedule request for {candidate} at {USER_CONSULATE}. "
+                        "Check your AIS account for the updated appointment."
                     )
-                    gmail.send(msg)
-                    gmail.close()
-                    log_message("SUCCESSFULLY RESCHEDULED!!!")
-                    return True
-                return False
-            except Exception as e:
-                log_message(f"Rescheduling failed: {e}")
-                traceback.print_exc()
-                continue
-        else:
-            log_message(f"Earliest available date is {earliest_available_date}")
+                    log_message(message)
+                    send_notification("Visa appointment reschedule submitted", message)
+                return True
         sleep(DATE_REQUEST_DELAY)
     return False
 
 
-def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> bool:
+def reschedule_with_new_session(
+    retryCount: int = DATE_REQUEST_MAX_RETRY, *, check_only: bool = False
+) -> bool:
     driver, temp_dir = get_chrome_driver()
-    session_failures = 0
-    timeout = TIMEOUT
-    while session_failures < NEW_SESSION_AFTER_FAILURES:
-        try:
-            login(driver)
-            get_appointment_page(driver)
-            _prepare_appointment_page(driver)
-            break
-        except Exception as e:
-            log_message(f"Unable to get appointment page at {driver.current_url}: {e}")
-            session_failures += 1
-            sleep(FAIL_RETRY_DELAY)
-            continue
-    
     try:
-        rescheduled = reschedule(driver, retryCount)
-    except Exception as e:
-        log_message(f"Browser session lost during reschedule: {e}")
-        log_message("Attempting to recreate session...")
-        try:
-            driver.quit()
-        except:
-            pass
-        # 清理当前会话的临时目录
-        try:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
-        # 重新创建会话并重试
-        return reschedule_with_new_session(retryCount)
+        attempts = 1 if check_only else NEW_SESSION_AFTER_FAILURES
+        for attempt in range(attempts):
+            try:
+                login(driver)
+                get_appointment_page(driver)
+                _prepare_appointment_page(driver)
+                break
+            except Exception as error:
+                log_message(f"Unable to open the appointment form: {type(error).__name__}")
+                if attempt + 1 < attempts:
+                    sleep(FAIL_RETRY_DELAY)
+        else:
+            return False
+
+        if check_only:
+            select_consulate(driver)
+            log_message(f"Selected {USER_CONSULATE} on the appointment form")
+            dates = get_available_dates(driver, RequestTracker(1, TIMEOUT))
+            if dates is None:
+                return False
+            candidates = eligible_dates(dates)
+            log_message(f"Date check passed. {len(dates)} available, {len(candidates)} within your preferences.")
+            if candidates:
+                log_message(f"Earliest matching date: {candidates[0]}")
+            return True
+        return reschedule(driver, retryCount)
+    except AppointmentSubmissionUnknown:
+        raise
+    except Exception as error:
+        log_message(f"Appointment session failed: {type(error).__name__}")
+        return False
     finally:
         try:
             driver.quit()
-        except:
-            pass  # 如果 driver 已经关闭，忽略错误
-        # 清理当前会话的临时目录
-        try:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                log_message(f"已清理临时目录: {temp_dir}")
-        except Exception as e:
-            log_message(f"清理临时目录时出错 {temp_dir}: {e}")
-    
-    if rescheduled:
-        return True
-    else:
-        return False
+        except Exception as error:
+            log_message(f"Could not close the browser: {type(error).__name__}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true", help="Sign in, select the consulate and check dates once")
+    args = parser.parse_args()
+    if not USER_EMAIL or not USER_PASSWORD:
+        parser.error("Set USER_EMAIL and USER_PASSWORD in .env")
+    try:
+        eligible_dates([])
+    except ValueError as error:
+        parser.error(str(error))
+
+    if args.check:
+        return 0 if reschedule_with_new_session(check_only=True) else 1
+
+    if TEST_MODE:
+        log_message("Test mode: preview a matching slot without submitting the appointment")
+    try:
+        while not reschedule_with_new_session():
+            sleep(NEW_SESSION_DELAY)
+    except AppointmentSubmissionUnknown as error:
+        log_message(str(error))
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    session_count = 0
-    log_message(f"Attempting to reschedule for email: {USER_EMAIL}")
-    log_message(f"User Consulate: {USER_CONSULATE}")
-    log_message(f"Earliest Acceptable Date: {EARLIEST_ACCEPTABLE_DATE}")
-    log_message(f"Latest Acceptable Date: {LATEST_ACCEPTABLE_DATE}")
-
-    if EXCLUSION_DATE_RANGES:
-        log_message("Excluded Date Ranges:")
-        for i, (start, end) in enumerate(EXCLUSION_DATE_RANGES, 1):
-            log_message(f"  Range {i}: {start} to {end}")
-    else:
-        log_message("No date ranges excluded")
-
-    # 程序启动时清理所有旧的临时目录
-    log_message("正在清理旧的临时目录...")
-    cleanup_old_chrome_dirs(max_age_hours=1)
-
-    try:
-        while True:
-            session_count += 1
-            log_message(f"Attempting with new session #{session_count}")
-            rescheduled = reschedule_with_new_session()
-            sleep(NEW_SESSION_DELAY)
-            if rescheduled:
-                break
-    finally:
-        # 程序退出前再次清理临时目录
-        log_message("程序退出，清理所有临时目录...")
-        cleanup_old_chrome_dirs(max_age_hours=0)
-    
-    gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
-    msg = Message(
-        f"Rescheduler Program Exited",
-        to=f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>",
-        text=f"The rescheduler program has exited on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
-    )
-    gmail.send(msg)
-    gmail.close()
+    raise SystemExit(main())
