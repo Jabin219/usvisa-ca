@@ -79,10 +79,16 @@ python reschedule.py --check
 This signs in using `.env`, selects the configured consulate, checks for dates once, and exits.
 
 ```sh
+python reschedule.py --notify-and-reschedule
+```
+
+Set `TEST_MODE = False` in `settings.py` and configure `GMAIL_EMAIL`, `GMAIL_APPLICATION_PWD`, and `RECEIVER_EMAIL` in `.env`. When dates match your preferences, this mode queues a Gmail alert while attempting to reschedule. It sends a follow-up after submission. Open AIS to verify the final appointment.
+
+```sh
 python reschedule.py
 ```
 
-With the default `TEST_MODE = True`, polling continues until it can preview a matching city, date, and time. The preview stops before form submission. Set `TEST_MODE = False` in `settings.py` to enable submission. Check your AIS account after the script reports a submission.
+With `TEST_MODE = True`, polling continues until it can preview a matching city, date, and time. The preview stops before form submission. Set `TEST_MODE = False` in `settings.py` to enable submission. Check your AIS account after the script reports a submission.
 
 Note `detect_and_notify.py` is no longer maintained.
 

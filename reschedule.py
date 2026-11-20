@@ -2,6 +2,8 @@ import argparse
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date, datetime
 from time import sleep
 from urllib.parse import urlsplit
@@ -231,17 +233,19 @@ def eligible_dates(dates: list[date]) -> list[date]:
     ]
 
 
-def send_notification(subject: str, message: str) -> None:
+def send_notification(subject: str, message: str) -> bool:
     if not all((GMAIL_EMAIL, GMAIL_APPLICATION_PWD, RECEIVER_EMAIL)):
-        return
+        return False
     gmail = None
     try:
         sender = f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>" if GMAIL_SENDER_NAME else GMAIL_EMAIL
         recipient = f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>" if RECEIVER_NAME else RECEIVER_EMAIL
         gmail = GMail(sender, GMAIL_APPLICATION_PWD)
         gmail.send(Message(subject, to=recipient, text=message))
+        return True
     except Exception as error:
         log_message(f"Email notification failed: {type(error).__name__}")
+        return False
     finally:
         if gmail is not None:
             try:
@@ -250,7 +254,22 @@ def send_notification(subject: str, message: str) -> None:
                 log_message(f"Could not close email connection: {type(error).__name__}")
 
 
-def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
+def send_slot_alert(candidate: date) -> bool:
+    subject = f"{USER_CONSULATE} 美签面签空位 {candidate}"
+    message = (
+        f"AIS 查到 {USER_CONSULATE} 在 {candidate} 有符合你日期设置的面签空位。\n"
+        f"脚本正在尝试自动改签。你可以登录 AIS 查看当前预约。\n{LOGIN_URL}"
+    )
+    sent = send_notification(subject, message)
+    if sent:
+        log_message(f"Gmail accepted the availability alert for {candidate}")
+    return sent
+
+
+def reschedule(
+    driver: WebDriver, retryCount: int = 0, *,
+    on_match: Callable[[date], None] | None = None,
+) -> bool:
     date_request_tracker = RequestTracker(
         retryCount if retryCount > 0 else DATE_REQUEST_MAX_RETRY,
         DATE_REQUEST_DELAY * retryCount if retryCount > 0 else DATE_REQUEST_MAX_TIME,
@@ -261,9 +280,21 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
             candidates = eligible_dates(dates)
             if not candidates:
                 log_message(f"{len(dates)} available dates. None match your date preferences.")
+            elif on_match is not None:
+                on_match(candidates[0])
             for candidate in candidates:
                 log_message(f"Found a matching date at {USER_CONSULATE}: {candidate}")
-                if not legacy_reschedule(driver, candidate):
+                try:
+                    selected = legacy_reschedule(driver, candidate)
+                except AppointmentSubmissionUnknown:
+                    if on_match is not None:
+                        send_notification(
+                            "美签面签改签状态待确认",
+                            f"{USER_CONSULATE} {candidate} 的提交状态待确认。"
+                            f"请登录 AIS 查看当前预约。\n{LOGIN_URL}",
+                        )
+                    raise
+                if not selected:
                     log_message(f"Could not select the exact slot for {candidate}")
                     continue
                 if not TEST_MODE:
@@ -272,14 +303,16 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
                         "Check your AIS account for the updated appointment."
                     )
                     log_message(message)
-                    send_notification("Visa appointment reschedule submitted", message)
+                    if send_notification("Visa appointment reschedule submitted", message):
+                        log_message("Gmail accepted the submission notification")
                 return True
         sleep(DATE_REQUEST_DELAY)
     return False
 
 
 def reschedule_with_new_session(
-    retryCount: int = DATE_REQUEST_MAX_RETRY, *, check_only: bool = False
+    retryCount: int = DATE_REQUEST_MAX_RETRY, *,
+    check_only: bool = False, on_match: Callable[[date], None] | None = None,
 ) -> bool:
     driver, temp_dir = get_chrome_driver()
     try:
@@ -308,7 +341,7 @@ def reschedule_with_new_session(
             if candidates:
                 log_message(f"Earliest matching date: {candidates[0]}")
             return True
-        return reschedule(driver, retryCount)
+        return reschedule(driver, retryCount, on_match=on_match)
     except AppointmentSubmissionUnknown:
         raise
     except Exception as error:
@@ -324,7 +357,12 @@ def reschedule_with_new_session(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--check", action="store_true", help="Sign in, select the consulate and check dates once")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="Sign in, select the consulate and check dates once")
+    mode.add_argument(
+        "--notify-and-reschedule", action="store_true",
+        help="Email matching dates and automatically submit a reschedule request",
+    )
     args = parser.parse_args()
     if not USER_EMAIL or not USER_PASSWORD:
         parser.error("Set USER_EMAIL and USER_PASSWORD in .env")
@@ -336,14 +374,31 @@ def main() -> int:
     if args.check:
         return 0 if reschedule_with_new_session(check_only=True) else 1
 
-    if TEST_MODE:
+    if args.notify_and_reschedule:
+        if TEST_MODE:
+            parser.error("Set TEST_MODE = False to submit reschedule requests")
+        if not all((GMAIL_EMAIL, GMAIL_APPLICATION_PWD, RECEIVER_EMAIL)):
+            parser.error("Set GMAIL_EMAIL, GMAIL_APPLICATION_PWD and RECEIVER_EMAIL in .env")
+        log_message("Automatic rescheduling and Gmail slot alerts enabled")
+    elif TEST_MODE:
         log_message("Test mode: preview a matching slot without submitting the appointment")
-    try:
-        while not reschedule_with_new_session():
-            sleep(NEW_SESSION_DELAY)
-    except AppointmentSubmissionUnknown as error:
-        log_message(str(error))
-        return 1
+
+    with ThreadPoolExecutor(max_workers=1) as alerts:
+        queued: dict[date, Future[bool]] = {}
+
+        def queue_slot_alert(candidate: date) -> None:
+            previous = queued.get(candidate)
+            if previous is not None and (not previous.done() or previous.result()):
+                return
+            queued[candidate] = alerts.submit(send_slot_alert, candidate)
+
+        on_match = queue_slot_alert if args.notify_and_reschedule else None
+        try:
+            while not reschedule_with_new_session(on_match=on_match):
+                sleep(NEW_SESSION_DELAY)
+        except AppointmentSubmissionUnknown as error:
+            log_message(str(error))
+            return 1
     return 0
 
 

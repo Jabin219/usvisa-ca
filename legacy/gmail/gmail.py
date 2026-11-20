@@ -10,6 +10,7 @@ except ImportError:
     from multiprocessing.queues import SimpleQueue
 import os.path
 import smtplib
+import ssl
 import time
 
 from email.utils import formatdate,make_msgid,getaddresses,parseaddr
@@ -64,10 +65,10 @@ class GMail(object):
         """
             Connect to GMail SMTP service using smtplib
         """
-        self.session = smtplib.SMTP(self.server,self.port)
+        self.session = smtplib.SMTP(self.server, self.port, timeout=15)
         self.session.set_debuglevel(self.debug)
         self.session.ehlo()
-        self.session.starttls()
+        self.session.starttls(context=ssl.create_default_context())
         self.session.ehlo()
         self.session.login(self.username,self.password)
 
