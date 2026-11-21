@@ -5,16 +5,26 @@ import tempfile
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date, datetime
+from itertools import count
 from time import sleep
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from selenium import webdriver
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    InvalidSessionIdException,
+    NoSuchElementException,
+    NoSuchWindowException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from urllib3.exceptions import HTTPError as BrowserConnectionError
 
 from legacy.gmail import GMail, Message
 from legacy_rescheduler import (
@@ -23,8 +33,31 @@ from legacy_rescheduler import (
     legacy_reschedule,
     select_consulate,
 )
-from request_tracker import RequestTracker
 from settings import *
+
+
+class SessionExpired(RuntimeError):
+    """AIS is asking for sign-in again."""
+
+
+def _is_login_page(url: str) -> bool:
+    current = urlsplit(url)
+    login = urlsplit(LOGIN_URL)
+    return (
+        current.scheme == login.scheme
+        and current.netloc == login.netloc
+        and current.path.rstrip("/") == login.path.rstrip("/")
+    )
+
+
+def _is_appointment_page(url: str) -> bool:
+    current = urlsplit(url)
+    site = urlsplit(LOGIN_URL)
+    return (
+        current.scheme == site.scheme
+        and current.netloc == site.netloc
+        and re.fullmatch(r"/en-ca/niv/schedule/\d+/appointment/?", current.path) is not None
+    )
 
 
 def log_message(message: str) -> None:
@@ -171,19 +204,13 @@ def get_appointment_page(driver: WebDriver) -> None:
     driver.get(appointment_url)
 
 
-def get_available_dates(
-    driver: WebDriver, request_tracker: RequestTracker
-) -> list[date] | None:
-    request_tracker.log_retry()
-    request_tracker.retry()
-    current_url = urlsplit(driver.current_url)
-    appointment_site = urlsplit(LOGIN_URL)
-    if (
-        current_url.scheme != appointment_site.scheme
-        or current_url.netloc != appointment_site.netloc
-        or not re.fullmatch(r"/en-ca/niv/schedule/\d+/appointment/?", current_url.path)
-    ):
+def get_available_dates(driver: WebDriver) -> list[date] | None:
+    browser_url = driver.current_url
+    if _is_login_page(browser_url):
+        raise SessionExpired("Browser returned to sign-in")
+    if not _is_appointment_page(browser_url):
         raise RuntimeError("The browser is not on the appointment form")
+    current_url = urlsplit(browser_url)
 
     request_url = (
         f"{current_url.scheme}://{current_url.netloc}{current_url.path.rstrip('/')}"
@@ -201,6 +228,12 @@ def get_available_dates(
     except requests.RequestException as error:
         log_message(f"Date request failed: {type(error).__name__}")
         return None
+    if response.status_code == 401:
+        raise SessionExpired("Date request returned HTTP 401")
+    if 300 <= response.status_code < 400 and _is_login_page(
+        urljoin(request_url, response.headers.get("Location", ""))
+    ):
+        raise SessionExpired("Date request redirected to sign-in")
     if response.status_code != 200:
         log_message(f"Date request returned HTTP {response.status_code}")
         return None
@@ -267,15 +300,12 @@ def send_slot_alert(candidate: date) -> bool:
 
 
 def reschedule(
-    driver: WebDriver, retryCount: int = 0, *,
+    driver: WebDriver, *,
     on_match: Callable[[date], None] | None = None,
 ) -> bool:
-    date_request_tracker = RequestTracker(
-        retryCount if retryCount > 0 else DATE_REQUEST_MAX_RETRY,
-        DATE_REQUEST_DELAY * retryCount if retryCount > 0 else DATE_REQUEST_MAX_TIME,
-    )
-    while date_request_tracker.should_retry():
-        dates = get_available_dates(driver, date_request_tracker)
+    for poll_number in count(1):
+        log_message(f"Checking available dates (session check {poll_number})")
+        dates = get_available_dates(driver)
         if dates is not None:
             candidates = eligible_dates(dates)
             if not candidates:
@@ -294,6 +324,17 @@ def reschedule(
                             f"请登录 AIS 查看当前预约。\n{LOGIN_URL}",
                         )
                     raise
+                except (
+                    ElementClickInterceptedException,
+                    ElementNotInteractableException,
+                    NoSuchElementException,
+                    StaleElementReferenceException,
+                    TimeoutException,
+                ) as error:
+                    if _is_login_page(driver.current_url):
+                        raise SessionExpired("Browser returned to sign-in") from error
+                    log_message(f"Slot selection was interrupted: {type(error).__name__}")
+                    break
                 if not selected:
                     log_message(f"Could not select the exact slot for {candidate}")
                     continue
@@ -307,33 +348,43 @@ def reschedule(
                         log_message("Gmail accepted the submission notification")
                 return True
         sleep(DATE_REQUEST_DELAY)
-    return False
 
 
 def reschedule_with_new_session(
-    retryCount: int = DATE_REQUEST_MAX_RETRY, *,
-    check_only: bool = False, on_match: Callable[[date], None] | None = None,
+    *, check_only: bool = False, on_match: Callable[[date], None] | None = None,
 ) -> bool:
     driver, temp_dir = get_chrome_driver()
     try:
         attempts = 1 if check_only else NEW_SESSION_AFTER_FAILURES
+        signed_in = False
         for attempt in range(attempts):
             try:
-                login(driver)
-                get_appointment_page(driver)
+                if not signed_in or _is_login_page(driver.current_url):
+                    signed_in = False
+                    login(driver)
+                    WebDriverWait(driver, TIMEOUT).until(
+                        lambda current_driver: not _is_login_page(current_driver.current_url)
+                    )
+                    signed_in = True
+                if not _is_appointment_page(driver.current_url):
+                    get_appointment_page(driver)
                 _prepare_appointment_page(driver)
                 break
+            except (InvalidSessionIdException, NoSuchWindowException, BrowserConnectionError):
+                raise
             except Exception as error:
                 log_message(f"Unable to open the appointment form: {type(error).__name__}")
                 if attempt + 1 < attempts:
                     sleep(FAIL_RETRY_DELAY)
+                elif signed_in and not check_only and not _is_login_page(driver.current_url):
+                    raise
         else:
             return False
 
         if check_only:
             select_consulate(driver)
             log_message(f"Selected {USER_CONSULATE} on the appointment form")
-            dates = get_available_dates(driver, RequestTracker(1, TIMEOUT))
+            dates = get_available_dates(driver)
             if dates is None:
                 return False
             candidates = eligible_dates(dates)
@@ -341,12 +392,21 @@ def reschedule_with_new_session(
             if candidates:
                 log_message(f"Earliest matching date: {candidates[0]}")
             return True
-        return reschedule(driver, retryCount, on_match=on_match)
+        log_message(f"Signed in. Checking every {DATE_REQUEST_DELAY} seconds while the session is active.")
+        return reschedule(driver, on_match=on_match)
+    except SessionExpired as error:
+        log_message(f"AIS session expired: {error}")
+        return False
+    except (InvalidSessionIdException, NoSuchWindowException, BrowserConnectionError) as error:
+        log_message(f"Browser session disconnected: {type(error).__name__}")
+        return False
     except AppointmentSubmissionUnknown:
         raise
     except Exception as error:
         log_message(f"Appointment session failed: {type(error).__name__}")
-        return False
+        if check_only:
+            return False
+        raise
     finally:
         try:
             driver.quit()

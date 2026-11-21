@@ -61,9 +61,7 @@ NEW_SESSION_AFTER_FAILURES = 5
 NEW_SESSION_DELAY = 120
 TIMEOUT = 10
 FAIL_RETRY_DELAY = 60
-DATE_REQUEST_DELAY = 60
-DATE_REQUEST_MAX_RETRY = 5
-DATE_REQUEST_MAX_TIME = 15 * 60
+DATE_REQUEST_DELAY = 180
 LOGIN_URL = "https://ais.usvisa-info.com/en-ca/niv/users/sign_in"
 AVAILABLE_DATE_REQUEST_SUFFIX = f"/days/{CONSULATES[USER_CONSULATE]}.json?appointments[expedite]=false"
 APPOINTMENT_PAGE_URL = "https://ais.usvisa-info.com/en-ca/niv/schedule/{id}/appointment"
